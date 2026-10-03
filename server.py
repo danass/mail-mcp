@@ -196,26 +196,27 @@ def _search(conn, acc: dict, query: str) -> list[int]:
     return sorted(int(x) for x in (data[0] or b"").split())
 
 
-def _move(conn, uids: list[int], dest_raw: str) -> None:
-    """UID MOVE in chunks; Gmail sometimes answers 'System Error' on a batch, so
-    retry that batch in smaller pieces before giving up."""
-    def attempt(batch, depth=0):
-        typ, data = conn.uid("MOVE", ",".join(map(str, batch)), _quote(dest_raw))
-        if typ == "OK":
-            return
-        if len(batch) == 1 or depth > 4:
-            if depth <= 4:
-                time.sleep(1)
-                typ, data = conn.uid("MOVE", str(batch[0]), _quote(dest_raw))
-                if typ == "OK":
-                    return
-            raise RuntimeError(f"IMAP MOVE failed: {data!r}")
+def _batched(conn, uids: list[int], command: str, *args) -> None:
+    """Run a UID command (MOVE, STORE) in chunks. Gmail sometimes answers
+    'System Error' on a batch: retry it once, then split it in halves."""
+    def attempt(batch):
+        for wait in (0, 1):
+            time.sleep(wait)
+            typ, data = conn.uid(command, ",".join(map(str, batch)), *args)
+            if typ == "OK":
+                return
+        if len(batch) == 1:
+            raise RuntimeError(f"IMAP {command} failed on uid {batch[0]}: {data!r}")
         mid = len(batch) // 2
-        attempt(batch[:mid], depth + 1)
-        attempt(batch[mid:], depth + 1)
+        attempt(batch[:mid])
+        attempt(batch[mid:])
 
     for i in range(0, len(uids), CHUNK):
         attempt(uids[i:i + CHUNK])
+
+
+def _move(conn, uids: list[int], dest_raw: str) -> None:
+    _batched(conn, uids, "MOVE", _quote(dest_raw))
 
 
 def _chunks(uids: list[int]):
@@ -414,21 +415,22 @@ def label(
         raise ValueError("Labels are Gmail-only; use move_to_folder.")
     with _imap(acc) as conn:
         if create_missing and add:
-            existing = {f["name"] for f in _folders(conn)}
+            existing = {f["name"].lower() for f in _folders(conn)}
             for name in add:
-                if not name.startswith("\\") and name not in existing:
-                    _check(*conn.create(_quote(_utf7_encode(name))), f"CREATE {name}")
+                if not name.startswith("\\") and name.lower() not in existing:
+                    typ, data = conn.create(_quote(_utf7_encode(name)))
+                    if typ != "OK" and b"ALREADYEXISTS" not in b"".join(d for d in data if isinstance(d, bytes)):
+                        raise RuntimeError(f"IMAP CREATE {name} failed: {data!r}")
         _select(conn, acc, None, readonly=False)
         targets = _resolve(conn, acc, uids, query, limit)
 
         def fmt(names):
             return "(" + " ".join(n if n.startswith("\\") else _quote(_utf7_encode(n)) for n in names) + ")"
 
-        for chunk in _chunks(targets):
-            if add:
-                _check(*conn.uid("STORE", chunk, "+X-GM-LABELS", fmt(add)), "STORE +labels")
-            if remove:
-                _check(*conn.uid("STORE", chunk, "-X-GM-LABELS", fmt(remove)), "STORE -labels")
+        if add:
+            _batched(conn, targets, "STORE", "+X-GM-LABELS", fmt(add))
+        if remove:
+            _batched(conn, targets, "STORE", "-X-GM-LABELS", fmt(remove))
     return {"updated": len(targets), "added": add or [], "removed": remove or []}
 
 
@@ -498,8 +500,7 @@ def mark_read(
     with _imap(acc) as conn:
         _select(conn, acc, None, readonly=False)
         targets = _resolve(conn, acc, uids, query, limit)
-        for chunk in _chunks(targets):
-            _check(*conn.uid("STORE", chunk, "+FLAGS" if read else "-FLAGS", "(\\Seen)"), "STORE flags")
+        _batched(conn, targets, "STORE", "+FLAGS" if read else "-FLAGS", "(\\Seen)")
     return {"updated": len(targets), "read": read}
 
 
