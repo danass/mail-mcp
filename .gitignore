@@ -1,2 +1,6 @@
 .venv/
 __pycache__/
+inventory-*.tsv
+*.xml
+sets.json
+accounts.json

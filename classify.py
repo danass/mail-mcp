@@ -70,8 +70,9 @@ if __name__ == "__main__":
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--xml")
     p.add_argument("--only", help="comma-separated set names")
+    p.add_argument("--sets", default=str(SETS_PATH), help=f"rules file (default {SETS_PATH})")
     a = p.parse_args()
-    sets = json.loads(SETS_PATH.read_text())[a.account]
+    sets = json.loads(Path(a.sets).read_text())[a.account]
     if a.only:
         sets = {k: v for k, v in sets.items() if k in a.only.split(",")}
     apply(a.account, sets, a.dry_run)

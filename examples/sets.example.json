@@ -1,0 +1,11 @@
+{
+  "perso": {
+    "Voyages": ["booking.com", "airbnb.com", "sncf-connect.com", "ouigo.com", "easyjet.com", "ryanair.com", "transavia.com", "airfrance.fr", "uber.com"],
+    "Logement": ["edf.fr", "enedis.fr", "engie.fr", "free.fr", "orange.fr", "sfr.fr", "bouyguestelecom.fr"],
+    "Banque": ["boursobank.com", "societegenerale.fr", "revolut.com", "wise.com", "paypal.com", "lydia-app.com"],
+    "Administratif": ["impots.gouv.fr", "ameli.fr", "caf.fr", "urssaf.fr", "service-public.fr", "francetravail.fr"],
+    "Achats": ["amazon.fr", "amazon.com", "fnac.com", "decathlon.fr", "leboncoin.fr", "vinted.fr"],
+    "Tech": ["github.com", "vercel.com", "google.com", "openai.com", "anthropic.com", "slack.com"],
+    "Newsletters": ["substack.com", "beehiiv.com", "medium.com"]
+  }
+}
