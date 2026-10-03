@@ -20,6 +20,7 @@ import re
 import smtplib
 import ssl
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -193,6 +194,28 @@ def _search(conn, acc: dict, query: str) -> list[int]:
         typ, data = conn.uid("SEARCH", *(query.split() if query else ["ALL"]))
     _check(typ, data, "SEARCH")
     return sorted(int(x) for x in (data[0] or b"").split())
+
+
+def _move(conn, uids: list[int], dest_raw: str) -> None:
+    """UID MOVE in chunks; Gmail sometimes answers 'System Error' on a batch, so
+    retry that batch in smaller pieces before giving up."""
+    def attempt(batch, depth=0):
+        typ, data = conn.uid("MOVE", ",".join(map(str, batch)), _quote(dest_raw))
+        if typ == "OK":
+            return
+        if len(batch) == 1 or depth > 4:
+            if depth <= 4:
+                time.sleep(1)
+                typ, data = conn.uid("MOVE", str(batch[0]), _quote(dest_raw))
+                if typ == "OK":
+                    return
+            raise RuntimeError(f"IMAP MOVE failed: {data!r}")
+        mid = len(batch) // 2
+        attempt(batch[:mid], depth + 1)
+        attempt(batch[mid:], depth + 1)
+
+    for i in range(0, len(uids), CHUNK):
+        attempt(uids[i:i + CHUNK])
 
 
 def _chunks(uids: list[int]):
@@ -424,8 +447,7 @@ def archive(account: str, uids: list[int] | None = None, query: str | None = Non
         dest = _special(conn, "\\Archive")
         _select(conn, acc, "INBOX", readonly=False)
         targets = _resolve(conn, acc, uids, query, limit)
-        for chunk in _chunks(targets):
-            _check(*conn.uid("MOVE", chunk, _quote(dest)), "MOVE")
+        _move(conn, targets, dest)
     return {"archived": len(targets)}
 
 
@@ -435,8 +457,7 @@ def _move_special(account, flag, uids, query, limit, folder=None):
         dest = _special(conn, flag)
         _select(conn, acc, folder, readonly=False)
         targets = _resolve(conn, acc, uids, query, limit)
-        for chunk in _chunks(targets):
-            _check(*conn.uid("MOVE", chunk, _quote(dest)), "MOVE")
+        _move(conn, targets, dest)
     return len(targets), _utf7_decode(dest)
 
 
@@ -464,8 +485,7 @@ def move_to_folder(
     with _imap(acc) as conn:
         _select(conn, acc, source, readonly=False)
         targets = _resolve(conn, acc, uids, query, limit)
-        for chunk in _chunks(targets):
-            _check(*conn.uid("MOVE", chunk, _quote(_utf7_encode(folder))), "MOVE")
+        _move(conn, targets, _utf7_encode(folder))
     return {"moved": len(targets), "folder": folder}
 
 
@@ -488,16 +508,19 @@ def _unsub_targets(header: str) -> list[str]:
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True))
-def unsubscribe(account: str, uid: int, dry_run: bool = False, allow_mailto: bool = True) -> dict:
+def unsubscribe(
+    account: str, uid: int, dry_run: bool = False, allow_mailto: bool = True, folder: str | None = None,
+) -> dict:
     """Unsubscribe from the list that sent message `uid` using its List-Unsubscribe header.
 
     Order of preference: RFC 8058 one-click HTTPS POST, then a mailto: request
     sent from the account over SMTP, else the link is returned for the user to
-    open by hand. dry_run=true only reports what would happen.
+    open by hand. dry_run=true only reports what would happen. `folder` lets
+    you point at a message already in Trash (uids are per folder).
     """
     acc = _account(account)
     with _imap(acc) as conn:
-        _select(conn, acc, None, readonly=True)
+        _select(conn, acc, folder, readonly=True)
         rows = _fetch_headers(conn, acc, [uid], "FROM LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST")
     if not rows:
         raise ValueError(f"No message with uid {uid}")
@@ -544,6 +567,54 @@ def unsubscribe(account: str, uid: int, dry_run: bool = False, allow_mailto: boo
         "sender": sender, "status": "manual",
         "detail": "No one-click endpoint; open this link to finish.",
         "url": https[0] if https else (targets[0] if targets else None),
+    }
+
+
+_GMAIL_TOKEN_ALPHABET = "BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz"
+_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _gmail_thread_id(link: str) -> int:
+    """Gmail web URLs (#inbox/FMfcgz...) encode "thread-f:<id>" in base64
+    re-spelled with a 40-consonant alphabet."""
+    token = link.rstrip("/").split("/")[-1].split("?")[0]
+    if token.isdigit() or re.fullmatch(r"[0-9a-f]{16}", token):
+        return int(token, 10 if token.isdigit() else 16)
+    n = 0
+    for ch in token:
+        n = n * 40 + _GMAIL_TOKEN_ALPHABET.index(ch)
+    b64 = ""
+    while n:
+        n, r = divmod(n, 64)
+        b64 = _B64_ALPHABET[r] + b64
+    decoded = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode()
+    return int(decoded.split(":")[-1])
+
+
+@mcp.tool(annotations=RO)
+def resolve_gmail_link(account: str, link: str) -> dict:
+    """Turn a Gmail web link (https://mail.google.com/mail/u/0/#inbox/FMfcgz...)
+    into the messages of that thread: uids, sender, subject, unsubscribe support."""
+    acc = _account(account)
+    if not _is_gmail(acc):
+        raise ValueError("Gmail links only work on Gmail accounts.")
+    thrid = _gmail_thread_id(link)
+    with _imap(acc) as conn:
+        _select(conn, acc, None, readonly=True)
+        typ, data = conn.uid("SEARCH", "X-GM-THRID", str(thrid))
+        _check(typ, data, "SEARCH")
+        uids = sorted(int(x) for x in (data[0] or b"").split())
+        rows = _fetch_headers(conn, acc, uids, "FROM SUBJECT DATE LIST-UNSUBSCRIBE")
+    return {
+        "thread_id": thrid,
+        "messages": [
+            {
+                "uid": r["uid"], "from": str(r["headers"].get("From", "")), "sender": _sender(r["headers"]),
+                "subject": str(r["headers"].get("Subject", "")), "date": str(r["headers"].get("Date", "")),
+                "can_unsubscribe": bool(r["headers"].get("List-Unsubscribe")),
+            }
+            for r in rows
+        ],
     }
 
 
